@@ -22,7 +22,9 @@ from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-from functools import partial, reduce
+from functools import partial
+
+from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
 
@@ -42,7 +44,29 @@ def set_shapes(transpose_input, batch_size, images, labels):
 
     return images, labels
 
-def parse_example(value, use_bfloat16=True, pixel_stats=None):
+
+def record_to_filename(url_base, record, site=1):
+    exp = record['experiment']
+    plate = record['plate']
+    return f'{url_base}/{exp}_p{plate}_s{site}.tfrecord'
+
+
+def get_tfrecord_names(url_base, df, split=False, valid_pct=0.2, site=1, seed=8086):
+    record_fn = partial(record_to_filename,
+                        url_base=url_base,
+                        site=site)
+    grouped = df.groupby(['experiment', 'plate'])
+
+    if split:
+        x = grouped.agg({'sirna': 'min'}).reset_index()
+        files = x.apply(record_fn)
+        labels = x['sirna']
+        return train_test_split(files, valid_pct=valid_pct, stratify=labels)
+    else:
+        return grouped.reset_index().apply(record_fn)
+
+
+def parse_train(value):
 
     keys_to_features = {
         'image': tf.FixedLenFeature((), tf.string),
@@ -55,9 +79,27 @@ def parse_example(value, use_bfloat16=True, pixel_stats=None):
         'experiment': tf.FixedLenFeature((), tf.string)
     }
 
+    return tf.parse_single_example(value, keys_to_features)
+
+
+def parse_test(value):
+
+    keys_to_features = {
+        'image': tf.FixedLenFeature((), tf.string),
+        'well': tf.FixedLenFeature((), tf.string),
+        'well_type': tf.FixedLenFeature((), tf.string),
+        'plate': tf.FixedLenFeature((), tf.int64),
+        'site': tf.FixedLenFeature((), tf.int64),
+        'cell_type': tf.FixedLenFeature((), tf.string),
+        'experiment': tf.FixedLenFeature((), tf.string)
+    }
+
+    return tf.parse_single_example(value, keys_to_features)
+
+
+def data_to_image(value, use_bfloat16=True, pixel_stats=None, test=False):
     image_shape = [512, 512, 6]
-    parsed = tf.parse_single_example(value, keys_to_features)
-    image_raw = tf.decode_raw(parsed['image'], tf.uint8)
+    image_raw = tf.decode_raw(value['image'], tf.uint8)
     image = tf.reshape(image_raw, image_shape)
     image.set_shape(image_shape)
 
@@ -68,9 +110,12 @@ def parse_example(value, use_bfloat16=True, pixel_stats=None):
     if use_bfloat16:
         image = tf.image.convert_image_dtype(image, dtype=tf.bfloat16)
 
-    label = parsed["sirna"]
+    if test:
+        return image
+    else:
+        label = value["sirna"]
 
-    return image, label
+        return image, label
 
 
 DEFAULT_PARAMS = dict(batch_size=512)
@@ -82,7 +127,9 @@ def input_fn(tf_records_glob,
              use_bfloat16=False,
              pixel_stats = None,
              transpose_input=True,
-             shuffle_buffer=64):
+             shuffle_buffer=64,
+             filter=None,
+             test=False):
 
     batch_size = params['batch_size']
 
@@ -111,15 +158,23 @@ def input_fn(tf_records_glob,
 
     images_dataset = images_dataset.shuffle(2048).repeat()
 
-    # examples dataset
+    # Parse out data
     dataset = images_dataset.apply(
         tf.contrib.data.map_and_batch(
-            lambda value: parse_example(value,
-                                        use_bfloat16=use_bfloat16,
-                                        pixel_stats=pixel_stats),
+            lambda value: parse_test if test else parse_train(value),
             batch_size=batch_size,
-            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
-            drop_remainder=True))
+            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls']))
+
+    # Do filter if it exits
+    if filter:
+        dataset = dataset.filter(lambda record: filter(record))
+
+    # Get image and label now
+    dataset = dataset.apply(
+        tf.contrib.data.map_and_batch(
+            lambda value: data_to_image(value, use_bfloat16=use_bfloat16, pixel_stats=pixel_stats),
+            batch_size=batch_size,
+            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls']))
 
     # Transpose for performance on TPU
     if transpose_input:
