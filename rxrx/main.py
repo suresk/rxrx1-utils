@@ -83,7 +83,9 @@ def main(use_tpu,
          train_df=None,
          test_df=None,
          valid_pct=.2,
-         resnet_depth=50):
+         resnet_depth=50,
+         valid_steps=16,
+         pred_batch_size=32):
     if use_tpu & (tpu is None):
         tpu = os.getenv('TPU_NAME')
     tf.logging.info('tpu: {}'.format(tpu))
@@ -137,7 +139,8 @@ def main(use_tpu,
         train_batch_size=train_batch_size,
         eval_batch_size=train_batch_size,
         predict_batch_size=train_batch_size,
-        export_to_tpu=False)
+        eval_on_tpu=True,
+        export_to_cpu=True)
 
     use_bfloat16 = (tf_precision == 'bfloat16')
 
@@ -145,7 +148,7 @@ def main(use_tpu,
 
     tf.logging.info("Train glob: {}".format(tfrecord_glob))
 
-    train_files, valid_files = rxinput.get_tfrecord_names(url_base_path, train_df, True)
+    train_files, valid_files = rxinput.get_tfrecord_names(url_base_path, train_df, True, valid_pct=valid_pct)
 
     train_input_fn = functools.partial(rxinput.input_fn,
                                        train_files,
@@ -169,7 +172,7 @@ def main(use_tpu,
 
     resnet_classifier.train(input_fn=train_input_fn, max_steps=train_steps)
 
-    resnet_classifier.evaluate(input_fn=valid_input_fn, steps=16)
+    resnet_classifier.evaluate(input_fn=valid_input_fn, steps=valid_steps)
 
     tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
                     train_steps, int(time.time() - start_timestamp))
@@ -195,11 +198,21 @@ def main(use_tpu,
                                        test_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
-                                       transpose_input=transpose_input,
+                                       transpose_input=False,
                                        use_bfloat16=use_bfloat16,
                                        test=True)
 
-    return resnet_classifier.predict(input_fn=test_input_fn)
+    resnet_classifier_cpu = tf.contrib.tpu.TPUEstimator(
+        use_tpu=False,
+        model_fn=model_fn,
+        config=config,
+        train_batch_size=pred_batch_size    ,
+        eval_batch_size=pred_batch_size,
+        predict_batch_size=pred_batch_size,
+        eval_on_tpu=True,
+        export_to_cpu=True)
+
+    return resnet_classifier_cpu.predict(input_fn=test_input_fn)
 
 
 if __name__ == '__main__':

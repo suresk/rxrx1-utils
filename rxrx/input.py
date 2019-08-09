@@ -45,44 +45,25 @@ def set_shapes(transpose_input, batch_size, images, labels):
     return images, labels
 
 
-def record_to_filename(url_base, record, site=1):
-    exp = record['experiment']
-    plate = record['plate']
+def record_to_filename(record, url_base, site=1):
+    exp = record[0]
+    plate = record[1]
     return f'{url_base}/{exp}_p{plate}_s{site}.tfrecord'
 
 
 def get_tfrecord_names(url_base, df, split=False, valid_pct=0.2, site=1, seed=8086):
-    record_fn = partial(record_to_filename,
-                        url_base=url_base,
-                        site=site)
     grouped = df.groupby(['experiment', 'plate'])
 
     if split:
         x = grouped.agg({'sirna': 'min'}).reset_index()
-        files = x.apply(record_fn)
+        files = x.apply(lambda row: record_to_filename(row, url_base=url_base), axis=1)
         labels = x['sirna']
-        return train_test_split(files, valid_pct=valid_pct, stratify=labels)
+        return train_test_split(files.values, test_size=valid_pct, stratify=labels.values)
     else:
-        return grouped.reset_index().apply(record_fn)
+        return [record_to_filename(key, url_base=url_base) for key in grouped.groups.keys()]
 
 
-def parse_train(value):
-
-    keys_to_features = {
-        'image': tf.FixedLenFeature((), tf.string),
-        'well': tf.FixedLenFeature((), tf.string),
-        'well_type': tf.FixedLenFeature((), tf.string),
-        'plate': tf.FixedLenFeature((), tf.int64),
-        'site': tf.FixedLenFeature((), tf.int64),
-        'cell_type': tf.FixedLenFeature((), tf.string),
-        'sirna': tf.FixedLenFeature((), tf.int64),
-        'experiment': tf.FixedLenFeature((), tf.string)
-    }
-
-    return tf.parse_single_example(value, keys_to_features)
-
-
-def parse_test(value):
+def parse(value, test=False):
 
     keys_to_features = {
         'image': tf.FixedLenFeature((), tf.string),
@@ -94,10 +75,18 @@ def parse_test(value):
         'experiment': tf.FixedLenFeature((), tf.string)
     }
 
-    return tf.parse_single_example(value, keys_to_features)
+    if not test:
+        keys_to_features['sirna'] = tf.FixedLenFeature((), tf.int64)
+
+    res = tf.parse_single_example(value, keys_to_features)
+
+    if test:
+        res['sirna'] = 10000
+
+    return res
 
 
-def data_to_image(value, use_bfloat16=True, pixel_stats=None, test=False):
+def data_to_image(value, use_bfloat16=True, pixel_stats=None):
     image_shape = [512, 512, 6]
     image_raw = tf.decode_raw(value['image'], tf.uint8)
     image = tf.reshape(image_raw, image_shape)
@@ -110,12 +99,8 @@ def data_to_image(value, use_bfloat16=True, pixel_stats=None, test=False):
     if use_bfloat16:
         image = tf.image.convert_image_dtype(image, dtype=tf.bfloat16)
 
-    if test:
-        return image
-    else:
-        label = value["sirna"]
-
-        return image, label
+    label = value["sirna"]
+    return image, label
 
 
 DEFAULT_PARAMS = dict(batch_size=512)
@@ -128,7 +113,6 @@ def input_fn(tf_records_glob,
              pixel_stats = None,
              transpose_input=True,
              shuffle_buffer=64,
-             filter=None,
              test=False):
 
     batch_size = params['batch_size']
@@ -145,36 +129,30 @@ def input_fn(tf_records_glob,
                 'tfrecord_dataset_num_parallel_reads'])
         return dataset
 
-    images_dataset = filenames_dataset.apply(
-        tf.contrib.data.parallel_interleave(
-            fetch_images,
-            cycle_length=input_fn_params['parallel_interleave_cycle_length'],
-            block_length=input_fn_params['parallel_interleave_block_length'],
-            sloppy=True,
-            buffer_output_elements=input_fn_params[
-                'parallel_interleave_buffer_output_elements'],
-            prefetch_input_elements=input_fn_params[
-                'parallel_interleave_prefetch_input_elements']))
+    if test:
+        images_dataset = filenames_dataset.apply(fetch_images)
+    else:
+        images_dataset = filenames_dataset.apply(
+            tf.contrib.data.parallel_interleave(
+                fetch_images,
+                cycle_length=input_fn_params['parallel_interleave_cycle_length'],
+                block_length=input_fn_params['parallel_interleave_block_length'],
+                sloppy=True,
+                buffer_output_elements=input_fn_params[
+                    'parallel_interleave_buffer_output_elements'],
+                prefetch_input_elements=input_fn_params[
+                    'parallel_interleave_prefetch_input_elements']))
 
-    images_dataset = images_dataset.shuffle(2048).repeat()
-
-    # Parse out data
-    dataset = images_dataset.apply(
-        tf.contrib.data.map_and_batch(
-            lambda value: parse_test if test else parse_train(value),
-            batch_size=batch_size,
-            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls']))
-
-    # Do filter if it exits
-    if filter:
-        dataset = dataset.filter(lambda record: filter(record))
+    if not test:
+        images_dataset = images_dataset.shuffle(2048).repeat()
 
     # Get image and label now
-    dataset = dataset.apply(
+    dataset = images_dataset.apply(
         tf.contrib.data.map_and_batch(
-            lambda value: data_to_image(value, use_bfloat16=use_bfloat16, pixel_stats=pixel_stats),
+            lambda value: data_to_image(parse(value, test), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats),
             batch_size=batch_size,
-            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls']))
+            num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
+            drop_remainder=not test))
 
     # Transpose for performance on TPU
     if transpose_input:
@@ -188,5 +166,7 @@ def input_fn(tf_records_glob,
     # Prefetch overlaps in-feed with training
     dataset = dataset.prefetch(
         buffer_size=input_fn_params['prefetch_buffer_size'])
+
+    print(dataset.output_shapes)
 
     return dataset
