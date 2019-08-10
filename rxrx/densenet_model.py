@@ -32,8 +32,8 @@ import tensorflow as tf
 _BATCH_NORM_DECAY = 0.997
 _BATCH_NORM_EPSILON = 1e-5
 
-FLAGS = flags.FLAGS
-flags.DEFINE_bool("use_bottleneck", False, "Use bottleneck convolution layers")
+# FLAGS = flags.FLAGS
+# flags.DEFINE_bool("use_bottleneck", False, "Use bottleneck convolution layers")
 
 
 def conv(image, filters, strides=1, kernel_size=3):
@@ -65,7 +65,7 @@ def dense_block(image, filters, is_training):
       epsilon=_BATCH_NORM_EPSILON,
   )
 
-  if FLAGS.use_bottleneck:
+  if False:
     # Add bottleneck layer to optimize computation and reduce HBM space
     image = tf.nn.relu(image)
     image = conv(image, 4 * filters, strides=1, kernel_size=1)

@@ -158,7 +158,7 @@ def input_fn(tf_records_glob,
             lambda value: data_to_image(parse(value, test), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats),
             batch_size=batch_size,
             num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
-            drop_remainder=not test))
+            drop_remainder=True))
 
 
     # Transpose for performance on TPU
