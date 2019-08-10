@@ -1,12 +1,13 @@
 import tensorflow as tf
 from rxrx.official_resnet import resnet_v1
+from rxrx.densenet_model import densenet_imagenet_121, densenet_imagenet_169, densenet_imagenet_201
 from tensorflow.contrib import summary
 
 def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
                     data_format, transpose_input, train_batch_size,
                     momentum, weight_decay, base_learning_rate,  warmup_epochs,
                     use_tpu, iterations_per_loop, model_dir, tf_precision,
-                    resnet_depth):
+                    model_depth, model='resnet'):
     """The model_fn for ResNet to be used with TPUEstimator.
 
     Args:
@@ -38,12 +39,27 @@ def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
     # This nested function allows us to avoid duplicating the logic which
     # builds the network, for different values of --precision.
     def build_network():
-        network = resnet_v1(
-            resnet_depth=resnet_depth,
-            num_classes=n_classes,
-            data_format=data_format)
-        return network(
-            inputs=features, is_training=(mode == tf.estimator.ModeKeys.TRAIN))
+        if model == 'resnet':
+            network = resnet_v1(
+                resnet_depth=model_depth,
+                num_classes=n_classes,
+                data_format=data_format)
+            return network(
+                inputs=features, is_training=(mode == tf.estimator.ModeKeys.TRAIN))
+        elif model == 'densenet':
+            if model_depth == 121:
+                return densenet_imagenet_121(features, is_training=(mode == tf.estimator.ModeKeys.TRAIN),
+                                             num_classes=n_classes)
+            elif model_depth == 169:
+                return densenet_imagenet_169(features, is_training=(mode == tf.estimator.ModeKeys.TRAIN),
+                                             num_classes=n_classes)
+            elif model_depth == 201:
+                return densenet_imagenet_201(features, is_training=(mode == tf.estimator.ModeKeys.TRAIN),
+                                             num_classes=n_classes)
+            else:
+                raise Exception(f'Unkown densenet model depth: {model_depth}')
+        else:
+            raise Exception(f'Unknown model: {model}')
 
     if tf_precision == 'bfloat16':
         with tf.contrib.tpu.bfloat16_scope():

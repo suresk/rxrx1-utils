@@ -23,21 +23,18 @@ from __future__ import division
 from __future__ import print_function
 
 import functools
+import math
 import os
 import time
 import argparse
 
 import numpy as np
 import tensorflow as tf
-from tensorflow.contrib import summary
 from tensorflow.python.estimator import estimator
-
-from sklearn.model_selection import train_test_split
 
 from .model import resnet_model_fn
 
 from rxrx import input as rxinput
-from rxrx.official_resnet import resnet_v1
 
 DEFAULT_INPUT_FN_PARAMS = {
     'tfrecord_dataset_buffer_size': 256,
@@ -57,6 +54,10 @@ GLOBAL_PIXEL_STATS = (np.array([6.74696984, 14.74640167, 10.51260864,
                        np.array([7.95876312, 12.17305868, 5.86172946,
                                  7.83451711, 4.701167, 5.43130431]))
 
+
+def dummy_pad_files(real, dummy, batch_size):
+    to_pad = math.ceil(batch_size / 277)
+    return real + dummy[:to_pad]
 
 def main(use_tpu,
          tpu,
@@ -83,9 +84,10 @@ def main(use_tpu,
          train_df=None,
          test_df=None,
          valid_pct=.2,
-         resnet_depth=50,
+         model='resnet',
+         model_depth=50,
          valid_steps=16,
-         pred_batch_size=32):
+         pred_batch_size=64):
     if use_tpu & (tpu is None):
         tpu = os.getenv('TPU_NAME')
     tf.logging.info('tpu: {}'.format(tpu))
@@ -130,7 +132,8 @@ def main(use_tpu,
         warmup_epochs=warmup_epochs,
         model_dir=model_dir,
         use_tpu=use_tpu,
-        resnet_depth=resnet_depth)
+        model_depth=model_depth,
+        model=model)
 
     resnet_classifier = tf.contrib.tpu.TPUEstimator(
         use_tpu=use_tpu,
@@ -193,6 +196,17 @@ def main(use_tpu,
     resnet_classifier.export_saved_model(os.path.join(model_dir, 'saved_model'), serving_input_receiver_fn)
 
     test_files = rxinput.get_tfrecord_names(url_base_path, test_df)
+    all_files = rxinput.get_tfrecord_names(url_base_path, train_df)
+
+    """
+    Kind of hacky, but append on some junk files so we use `drop_remainder` in the dataset to get fixed batch sizes for TPU,
+    then we can just ignore any beyond the real amount.
+    
+    Not sure if I have something configured wrong or what, but TPU prediction is like 100x faster than CPU prediction,
+    so I guess a bit of hackiness is worth it?
+    """
+
+    test_files = dummy_pad_files(test_files, all_files, pred_batch_size)
 
     test_input_fn = functools.partial(rxinput.input_fn,
                                        test_files,
@@ -202,17 +216,18 @@ def main(use_tpu,
                                        use_bfloat16=use_bfloat16,
                                        test=True)
 
-    resnet_classifier_cpu = tf.contrib.tpu.TPUEstimator(
-        use_tpu=False,
-        model_fn=model_fn,
-        config=config,
-        train_batch_size=pred_batch_size    ,
-        eval_batch_size=pred_batch_size,
-        predict_batch_size=pred_batch_size,
-        eval_on_tpu=True,
-        export_to_cpu=True)
+    # Also predict for all the training ones too (with garbage added on the end too) so that we can use that in other models
+    all_files = dummy_pad_files(all_files, test_files, pred_batch_size)
 
-    return resnet_classifier_cpu.predict(input_fn=test_input_fn)
+    all_input_fn = functools.partial(rxinput.input_fn,
+                                       all_files,
+                                       input_fn_params=input_fn_params,
+                                       pixel_stats=GLOBAL_PIXEL_STATS,
+                                       transpose_input=False,
+                                       use_bfloat16=use_bfloat16,
+                                       test=True)
+
+    return resnet_classifier.predict(input_fn=test_input_fn), resnet_classifier.predict(input_fn=all_input_fn)
 
 
 if __name__ == '__main__':

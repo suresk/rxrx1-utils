@@ -28,6 +28,8 @@ from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
 
+DUMMY_SIRNA = 10000
+
 
 def set_shapes(transpose_input, batch_size, images, labels):
     """Statically set the batch_size dimension."""
@@ -81,7 +83,7 @@ def parse(value, test=False):
     res = tf.parse_single_example(value, keys_to_features)
 
     if test:
-        res['sirna'] = 10000
+        res['sirna'] = DUMMY_SIRNA
 
     return res
 
@@ -101,6 +103,10 @@ def data_to_image(value, use_bfloat16=True, pixel_stats=None):
 
     label = value["sirna"]
     return image, label
+
+
+def get_dummy_record():
+    return tf.random.normal([512, 512, 6], dtype=tf.bfloat16), DUMMY_SIRNA
 
 
 DEFAULT_PARAMS = dict(batch_size=512)
@@ -154,6 +160,7 @@ def input_fn(tf_records_glob,
             num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
             drop_remainder=not test))
 
+
     # Transpose for performance on TPU
     if transpose_input:
         dataset = dataset.map(
@@ -166,7 +173,5 @@ def input_fn(tf_records_glob,
     # Prefetch overlaps in-feed with training
     dataset = dataset.prefetch(
         buffer_size=input_fn_params['prefetch_buffer_size'])
-
-    print(dataset.output_shapes)
 
     return dataset
