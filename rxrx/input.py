@@ -24,6 +24,8 @@ from __future__ import print_function
 
 from functools import partial
 
+import numpy as np
+
 from sklearn.model_selection import train_test_split
 
 import tensorflow as tf
@@ -53,16 +55,28 @@ def record_to_filename(record, url_base, site=1):
     return f'{url_base}/{exp}_p{plate}_s{site}.tfrecord'
 
 
-def get_tfrecord_names(url_base, df, split=False, valid_pct=0.2, site=1, seed=8086):
+def get_tfrecord_names(url_base, df, split=False, valid_pct=0.2, sites=[1,2], seed=None):
     grouped = df.groupby(['experiment', 'plate'])
 
+    train_files = []
+    valid_files = []
+
+    for site in sites:
+        if split:
+            x = grouped.agg({'sirna': 'min'}).reset_index()
+            files = x.apply(lambda row: record_to_filename(row, url_base=url_base, site=site), axis=1)
+            labels = x['sirna']
+            train, valid = train_test_split(files.values, test_size=valid_pct, random_state=seed, stratify=labels)
+            train_files = np.concatenate([train_files, train])
+            valid_files = np.concatenate([valid_files, valid])
+        else:
+            train = [record_to_filename(key, url_base=url_base, site=site) for key in grouped.groups.keys()]
+            train_files = np.concatenate([train_files, train])
+
     if split:
-        x = grouped.agg({'sirna': 'min'}).reset_index()
-        files = x.apply(lambda row: record_to_filename(row, url_base=url_base), axis=1)
-        labels = x['sirna']
-        return train_test_split(files.values, test_size=valid_pct, stratify=labels.values)
+        return train_files, valid_files
     else:
-        return [record_to_filename(key, url_base=url_base) for key in grouped.groups.keys()]
+        return train_files
 
 
 def parse(value, test=False):
@@ -88,10 +102,16 @@ def parse(value, test=False):
     return res
 
 
-def data_to_image(value, use_bfloat16=True, pixel_stats=None):
-    image_shape = [512, 512, 6]
+def data_to_image(value, use_bfloat16=True, pixel_stats=None, dim=512):
+
     image_raw = tf.decode_raw(value['image'], tf.uint8)
-    image = tf.reshape(image_raw, image_shape)
+    raw_shape = [512, 512, 6]
+    image_shape = [dim, dim, 6]
+    image = tf.reshape(image_raw, raw_shape)
+
+    if dim != 512:
+        image = tf.image.resize(image, [dim, dim])
+
     image.set_shape(image_shape)
 
     if pixel_stats is not None:
@@ -105,12 +125,7 @@ def data_to_image(value, use_bfloat16=True, pixel_stats=None):
     return image, label
 
 
-def get_dummy_record():
-    return tf.random.normal([512, 512, 6], dtype=tf.bfloat16), DUMMY_SIRNA
-
-
 DEFAULT_PARAMS = dict(batch_size=512)
-
 
 def input_fn(tf_records_glob,
              input_fn_params,
@@ -119,11 +134,12 @@ def input_fn(tf_records_glob,
              pixel_stats = None,
              transpose_input=True,
              shuffle_buffer=64,
-             test=False):
+             test=False,
+             dim=512):
 
     batch_size = params['batch_size']
 
-    filenames_dataset = tf.data.Dataset.list_files(tf_records_glob)
+    filenames_dataset = tf.data.Dataset.list_files(tf_records_glob, shuffle=not test)
 
     def fetch_images(filenames):
         dataset = tf.data.TFRecordDataset(
@@ -135,19 +151,16 @@ def input_fn(tf_records_glob,
                 'tfrecord_dataset_num_parallel_reads'])
         return dataset
 
-    if test:
-        images_dataset = filenames_dataset.apply(fetch_images)
-    else:
-        images_dataset = filenames_dataset.apply(
-            tf.contrib.data.parallel_interleave(
-                fetch_images,
-                cycle_length=input_fn_params['parallel_interleave_cycle_length'],
-                block_length=input_fn_params['parallel_interleave_block_length'],
-                sloppy=True,
-                buffer_output_elements=input_fn_params[
-                    'parallel_interleave_buffer_output_elements'],
-                prefetch_input_elements=input_fn_params[
-                    'parallel_interleave_prefetch_input_elements']))
+    images_dataset = filenames_dataset.apply(
+        tf.contrib.data.parallel_interleave(
+            fetch_images,
+            cycle_length=input_fn_params['parallel_interleave_cycle_length'],
+            block_length=input_fn_params['parallel_interleave_block_length'],
+            sloppy=not test,
+            buffer_output_elements=input_fn_params[
+                'parallel_interleave_buffer_output_elements'],
+            prefetch_input_elements=input_fn_params[
+                'parallel_interleave_prefetch_input_elements']))
 
     if not test:
         images_dataset = images_dataset.shuffle(2048).repeat()
@@ -155,7 +168,7 @@ def input_fn(tf_records_glob,
     # Get image and label now
     dataset = images_dataset.apply(
         tf.contrib.data.map_and_batch(
-            lambda value: data_to_image(parse(value, test), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats),
+            lambda value: data_to_image(parse(value, test), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats, dim=dim),
             batch_size=batch_size,
             num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
             drop_remainder=True))

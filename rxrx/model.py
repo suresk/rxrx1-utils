@@ -3,11 +3,11 @@ from rxrx.official_resnet import resnet_v1
 from rxrx.densenet_model import densenet_imagenet_121, densenet_imagenet_169, densenet_imagenet_201
 from tensorflow.contrib import summary
 
-def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
+def model_fn(features, labels, mode, params, n_classes, num_train_images,
                     data_format, transpose_input, train_batch_size,
-                    momentum, weight_decay, base_learning_rate,  warmup_epochs,
+                    weight_decay, base_learning_rate,  warmup_epochs,
                     use_tpu, iterations_per_loop, model_dir, tf_precision,
-                    model_depth, model='resnet'):
+                    model_depth, optimizer, model='resnet', pred_on_tpu=False):
     """The model_fn for ResNet to be used with TPUEstimator.
 
     Args:
@@ -33,7 +33,7 @@ def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
         assert not transpose_input  # channels_first only for GPU
         features = tf.transpose(features, [0, 3, 1, 2])
 
-    if transpose_input and mode != tf.estimator.ModeKeys.PREDICT:
+    if transpose_input and (mode != tf.estimator.ModeKeys.PREDICT or pred_on_tpu):
         features = tf.transpose(features, [3, 0, 1, 2])  # HWCN to NHWC
 
     # This nested function allows us to avoid duplicating the logic which
@@ -73,12 +73,21 @@ def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
             'classes': tf.argmax(logits, axis=1),
             'probabilities': tf.nn.softmax(logits, name='softmax_tensor')
         }
-        return tf.contrib.tpu.TPUEstimatorSpec(
-            mode=mode,
-            predictions=predictions,
-            export_outputs={
-                'classify': tf.estimator.export.PredictOutput(predictions)
-            })
+
+        if pred_on_tpu:
+            return tf.contrib.tpu.TPUEstimatorSpec(
+                mode=mode,
+                predictions=predictions,
+                export_outputs={
+                    'classify': tf.estimator.export.PredictOutput(predictions)
+                })
+        else:
+            return tf.estimator.EstimatorSpec(
+                mode=mode,
+                predictions=predictions,
+                export_outputs={
+                    'classify': tf.estimator.export.PredictOutput(predictions)
+                })
 
     # If necessary, in the model_fn, use params['batch_size'] instead the batch
     # size flags (--train_batch_size or --eval_batch_size).
@@ -114,11 +123,6 @@ def resnet_model_fn(features, labels, mode, params, n_classes, num_train_images,
                                                        alpha=0.0,
                                                        name=None)
 
-
-
-        optimizer = tf.train.MomentumOptimizer(learning_rate=learning_rate,
-                                               momentum=momentum,
-                                               use_nesterov=True)
 
         if use_tpu:
             # When using TPU, wrap the optimizer with CrossShardOptimizer which

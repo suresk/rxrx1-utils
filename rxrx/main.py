@@ -32,7 +32,7 @@ import numpy as np
 import tensorflow as tf
 from tensorflow.python.estimator import estimator
 
-from .model import resnet_model_fn
+from .model import model_fn
 
 from rxrx import input as rxinput
 
@@ -57,7 +57,7 @@ GLOBAL_PIXEL_STATS = (np.array([6.74696984, 14.74640167, 10.51260864,
 
 def dummy_pad_files(real, dummy, batch_size):
     to_pad = math.ceil(batch_size / 277)
-    return real + dummy[:to_pad]
+    return np.concatenate([real.tolist(), dummy[:to_pad]])
 
 def main(use_tpu,
          tpu,
@@ -87,7 +87,9 @@ def main(use_tpu,
          model='resnet',
          model_depth=50,
          valid_steps=16,
-         pred_batch_size=64):
+         pred_batch_size=64,
+         dim=512,
+         pred_on_tpu=False):
     if use_tpu & (tpu is None):
         tpu = os.getenv('TPU_NAME')
     tf.logging.info('tpu: {}'.format(tpu))
@@ -117,8 +119,14 @@ def main(use_tpu,
             per_host_input_for_training=tf.contrib.tpu.InputPipelineConfig.
                 PER_HOST_V2))  # pylint: disable=line-too-long
 
-    model_fn = functools.partial(
-        resnet_model_fn,
+    momentum_optimizer = tf.train.MomentumOptimizer(learning_rate=base_learning_rate,
+                                           momentum=momentum,
+                                           use_nesterov=True)
+
+    adam_optimizer = tf.train.AdamOptimizer(base_learning_rate)
+
+    train_model_fn = functools.partial(
+        model_fn,
         n_classes=n_classes,
         num_train_images=num_train_images,
         data_format=data_format,
@@ -126,18 +134,21 @@ def main(use_tpu,
         train_batch_size=train_batch_size,
         iterations_per_loop=iterations_per_loop,
         tf_precision=tf_precision,
-        momentum=momentum,
         weight_decay=weight_decay,
         base_learning_rate=base_learning_rate,
         warmup_epochs=warmup_epochs,
         model_dir=model_dir,
         use_tpu=use_tpu,
         model_depth=model_depth,
-        model=model)
+        optimizer=adam_optimizer,
+        model=model,
+        pred_on_tpu=pred_on_tpu)
 
-    resnet_classifier = tf.contrib.tpu.TPUEstimator(
+
+
+    classifier = tf.contrib.tpu.TPUEstimator(
         use_tpu=use_tpu,
-        model_fn=model_fn,
+        model_fn=train_model_fn,
         config=config,
         train_batch_size=train_batch_size,
         eval_batch_size=train_batch_size,
@@ -158,14 +169,16 @@ def main(use_tpu,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
                                        transpose_input=transpose_input,
-                                       use_bfloat16=use_bfloat16)
+                                       use_bfloat16=use_bfloat16,
+                                       dim=dim)
 
     valid_input_fn = functools.partial(rxinput.input_fn,
                                        valid_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
                                        transpose_input=transpose_input,
-                                       use_bfloat16=use_bfloat16)
+                                       use_bfloat16=use_bfloat16,
+                                       dim=dim)
 
     tf.logging.info('Training for %d steps (%.2f epochs in total). Current'
                     ' step %d.', train_steps, train_steps / steps_per_epoch,
@@ -173,9 +186,9 @@ def main(use_tpu,
 
     start_timestamp = time.time()  # This time will include compilation time
 
-    resnet_classifier.train(input_fn=train_input_fn, max_steps=train_steps)
+    classifier.train(input_fn=train_input_fn, max_steps=train_steps)
 
-    resnet_classifier.evaluate(input_fn=valid_input_fn, steps=valid_steps)
+    classifier.evaluate(input_fn=valid_input_fn, steps=valid_steps)
 
     tf.logging.info('Finished training up to step %d. Elapsed seconds %d.',
                     train_steps, int(time.time() - start_timestamp))
@@ -188,15 +201,25 @@ def main(use_tpu,
 
     def serving_input_receiver_fn():
         features = {
-            'feature': tf.placeholder(dtype=tf.float32, shape=[None, 512, 512, 6]),
+            'feature': tf.placeholder(dtype=tf.float32, shape=[None, dim, dim, 6]),
         }
         receiver_tensors = features
         return tf.estimator.export.ServingInputReceiver(features, receiver_tensors)
 
-    resnet_classifier.export_saved_model(os.path.join(model_dir, 'saved_model'), serving_input_receiver_fn)
+        classifier.export_saved_model(os.path.join(model_dir, 'saved_model'), serving_input_receiver_fn)
 
     test_files = rxinput.get_tfrecord_names(url_base_path, test_df)
     all_files = rxinput.get_tfrecord_names(url_base_path, train_df)
+
+    classifier_pred = tf.contrib.tpu.TPUEstimator(
+        use_tpu=pred_on_tpu,
+        model_fn=train_model_fn,
+        config=config,
+        train_batch_size=train_batch_size,
+        eval_batch_size=train_batch_size,
+        predict_batch_size=pred_batch_size,
+        eval_on_tpu=pred_on_tpu,
+        export_to_cpu=True)
 
     """
     Kind of hacky, but append on some junk files so we use `drop_remainder` in the dataset to get fixed batch sizes for TPU,
@@ -206,28 +229,32 @@ def main(use_tpu,
     so I guess a bit of hackiness is worth it?
     """
 
-    test_files = dummy_pad_files(test_files, all_files, pred_batch_size)
+    if pred_on_tpu:
+        test_files = dummy_pad_files(test_files, all_files, pred_batch_size)
 
     test_input_fn = functools.partial(rxinput.input_fn,
                                        test_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
-                                       transpose_input=False,
+                                       transpose_input=pred_on_tpu,
                                        use_bfloat16=use_bfloat16,
-                                       test=True)
+                                       test=True,
+                                       dim=dim)
 
-    # Also predict for all the training ones too (with garbage added on the end too) so that we can use that in other models
-    all_files = dummy_pad_files(all_files, test_files, pred_batch_size)
+    if pred_on_tpu:
+        # Also predict for all the training ones too (with garbage added on the end too) so that we can use that in other models
+        all_files = dummy_pad_files(all_files, test_files, pred_batch_size)
 
     all_input_fn = functools.partial(rxinput.input_fn,
                                        all_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
-                                       transpose_input=False,
+                                       transpose_input=pred_on_tpu,
                                        use_bfloat16=use_bfloat16,
-                                       test=True)
+                                       test=True,
+                                       dim=dim)
 
-    return resnet_classifier.predict(input_fn=test_input_fn), resnet_classifier.predict(input_fn=all_input_fn)
+    return classifier_pred.predict(input_fn=test_input_fn), classifier_pred.predict(input_fn=all_input_fn)
 
 
 if __name__ == '__main__':
