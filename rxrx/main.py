@@ -48,6 +48,18 @@ DEFAULT_INPUT_FN_PARAMS = {
     'prefetch_buffer_size': tf.contrib.data.AUTOTUNE,
 }
 
+PRED_INPUT_FN_PARAMS = {
+    'tfrecord_dataset_buffer_size': 2,
+    'tfrecord_dataset_num_parallel_reads': None,
+    'parallel_interleave_cycle_length': 32,
+    'parallel_interleave_block_length': 1,
+    'parallel_interleave_buffer_output_elements': None,
+    'parallel_interleave_prefetch_input_elements': None,
+    'map_and_batch_num_parallel_calls': 4,
+    'transpose_num_parallel_calls': 4,
+    'prefetch_buffer_size': 2,
+}
+
 # The mean and stds for each of the channels
 GLOBAL_PIXEL_STATS = (np.array([6.74696984, 14.74640167, 10.51260864,
                                 10.45369445,  5.49959796, 9.81545561]),
@@ -58,6 +70,10 @@ GLOBAL_PIXEL_STATS = (np.array([6.74696984, 14.74640167, 10.51260864,
 def dummy_pad_files(real, dummy, batch_size):
     to_pad = math.ceil(batch_size / 277)
     return np.concatenate([real.tolist(), dummy[:to_pad]])
+
+
+def parse_identifier(label):
+    return label.split(":")
 
 def main(use_tpu,
          tpu,
@@ -229,6 +245,8 @@ def main(use_tpu,
     so I guess a bit of hackiness is worth it?
     """
 
+    pred_params = {'batch_size': pred_batch_size}
+
     if pred_on_tpu:
         test_files = dummy_pad_files(test_files, all_files, pred_batch_size)
 
@@ -236,7 +254,7 @@ def main(use_tpu,
                                        test_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
-                                       transpose_input=pred_on_tpu,
+                                       transpose_input=False,
                                        use_bfloat16=use_bfloat16,
                                        test=True,
                                        dim=dim)
@@ -249,12 +267,17 @@ def main(use_tpu,
                                        all_files,
                                        input_fn_params=input_fn_params,
                                        pixel_stats=GLOBAL_PIXEL_STATS,
-                                       transpose_input=pred_on_tpu,
+                                       transpose_input=False,
                                        use_bfloat16=use_bfloat16,
                                        test=True,
                                        dim=dim)
 
-    return classifier_pred.predict(input_fn=test_input_fn), classifier_pred.predict(input_fn=all_input_fn)
+    return {
+        'test_dataset': test_input_fn(input_fn_params=PRED_INPUT_FN_PARAMS, params=pred_params, id_for_label=True, dim=3).make_one_shot_iterator(),
+        'test_predict': classifier_pred.predict(input_fn=test_input_fn, yield_single_examples=False),
+        'all_dataset': all_input_fn(input_fn_params=PRED_INPUT_FN_PARAMS, params=pred_params, id_for_label=True, dim=3).make_one_shot_iterator(),
+        'all_predict': classifier_pred.predict(input_fn=all_input_fn, yield_single_examples=False)
+    }
 
 
 if __name__ == '__main__':

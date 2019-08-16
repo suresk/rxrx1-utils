@@ -79,7 +79,7 @@ def get_tfrecord_names(url_base, df, split=False, valid_pct=0.2, sites=[1,2], se
         return train_files
 
 
-def parse(value, test=False):
+def parse(value, test=False, id_for_label=False):
 
     keys_to_features = {
         'image': tf.FixedLenFeature((), tf.string),
@@ -97,7 +97,10 @@ def parse(value, test=False):
     res = tf.parse_single_example(value, keys_to_features)
 
     if test:
-        res['sirna'] = DUMMY_SIRNA
+        if id_for_label:
+            res['sirna'] = tf.strings.format('{}_{}_{}:{}', (res['experiment'], res['plate'], res['well'], res["site"]))
+        else:
+            res['sirna'] = DUMMY_SIRNA
 
     return res
 
@@ -135,7 +138,8 @@ def input_fn(tf_records_glob,
              transpose_input=True,
              shuffle_buffer=64,
              test=False,
-             dim=512):
+             dim=512,
+             id_for_label=False):
 
     batch_size = params['batch_size']
 
@@ -168,7 +172,7 @@ def input_fn(tf_records_glob,
     # Get image and label now
     dataset = images_dataset.apply(
         tf.contrib.data.map_and_batch(
-            lambda value: data_to_image(parse(value, test), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats, dim=dim),
+            lambda value: data_to_image(parse(value, test, id_for_label=id_for_label), use_bfloat16=use_bfloat16, pixel_stats=pixel_stats, dim=dim),
             batch_size=batch_size,
             num_parallel_calls=input_fn_params['map_and_batch_num_parallel_calls'],
             drop_remainder=True))
